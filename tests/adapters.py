@@ -8,7 +8,7 @@ from jaxtyping import Float, Int
 import numpy.typing as npt
 import torch
 from torch import Tensor
-
+import cs336_basics.mynn as mynn
 
 
 def run_linear(
@@ -29,8 +29,9 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
-
-    raise NotImplementedError
+    linear = mynn.Linear(d_in, d_out, bias=False)
+    linear.weight.data = weights
+    return linear(in_features)
 
 
 def run_embedding(
@@ -51,8 +52,9 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-
-    raise NotImplementedError
+    emb = mynn.Embedding(vocab_size, d_model)
+    emb.weight.data = weights
+    return emb(token_ids)
 
 
 def run_swiglu(
@@ -84,7 +86,11 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    swiglu = mynn.SwiGLU(d_model, d_ff)
+    swiglu.w1.weight.data = w1_weight
+    swiglu.w2.weight.data = w2_weight
+    swiglu.w3.weight.data = w3_weight
+    return swiglu(in_features)
 
 
 def run_scaled_dot_product_attention(
@@ -105,7 +111,7 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    return mynn.scaled_dot_product_attention(Q, K, V, mask)
 
 
 def run_multihead_self_attention(
