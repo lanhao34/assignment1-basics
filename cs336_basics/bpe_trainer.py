@@ -170,12 +170,12 @@ def train_bpe(input_path, vocab_size, special_tokens, num_processes=8):
 if __name__=='__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num_processes", type=int, default=4)
+    parser.add_argument("--num_processes", type=int, default=8)
     parser.add_argument("--input_path", type=str, default="data/TinyStoriesV2-GPT4-valid.txt")
     parser.add_argument("--vocab_size", type=int, default=500)
     parser.add_argument("--special_tokens", type=list, default=["<|endoftext|>"])
     args = parser.parse_args()
-    vocab, merges = train_bpe(args.input_path, args.vocab_size, args.special_tokens)
+    vocab, merges = train_bpe(args.input_path, args.vocab_size, args.special_tokens, args.num_processes)
     print(merges)
     print(vocab)
     
