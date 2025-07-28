@@ -2,7 +2,9 @@ import regex as re
 import multiprocessing as mp
 from collections import Counter, OrderedDict
 from functools import reduce, partial
-
+from tqdm import tqdm, trange
+import time
+import psutil
 import os
 from typing import BinaryIO
 
@@ -128,7 +130,7 @@ def train_bpe(input_path, vocab_size, special_tokens, num_processes=8):
     sorted_pair = sorted(pair_counter.items(), key=lambda x: x[1], reverse=True)
     # print(sorted_pair[:10])
     # pair_counter = OrderedDict(sorted_pair)
-    while len(vocab) < vocab_size:
+    for _ in trange(vocab_size - len(vocab)):
         # get most frequent pair
         # max_pair = max(pair_counter.items(), key=lambda x: x[1])
         # merged_pair = max_pair[0]
@@ -175,8 +177,30 @@ if __name__=='__main__':
     parser.add_argument("--vocab_size", type=int, default=500)
     parser.add_argument("--special_tokens", type=list, default=["<|endoftext|>"])
     args = parser.parse_args()
+    # Track training start time and memory
+    start_time = time.time()
+    start_memory = psutil.Process().memory_info().rss / 1024 / 1024  # MB
+    print(f"Starting BPE training...")
+    print(f"Initial memory usage: {start_memory:.2f} MB")
+    
     vocab, merges = train_bpe(args.input_path, args.vocab_size, args.special_tokens, args.num_processes)
-    print(merges)
-    print(vocab)
+
+    # Calculate training statistics
+    end_time = time.time()
+    end_memory = psutil.Process().memory_info().rss / 1024 / 1024  # MB
+    training_hours = (end_time - start_time) / 3600
+    memory_used = end_memory - start_memory
+    
+    # Find the longest token in the vocabulary
+    longest_token = max(vocab.values(), key=len)
+    longest_token_length = len(longest_token)
+    
+    print(f"\n=== Training Statistics ===")
+    print(f"Training time: {training_hours:.4f} hours ({training_hours*60:.2f} minutes)")
+    print(f"Memory usage: {memory_used:.2f} MB (started at {start_memory:.2f} MB, ended at {end_memory:.2f} MB)")
+    print(f"Longest token in vocabulary: {repr(longest_token)} (length: {longest_token_length} bytes)")
+    print(f"Vocabulary size: {len(vocab)}")
+    print(f"Number of merges: {len(merges)}")
+    
     
     
