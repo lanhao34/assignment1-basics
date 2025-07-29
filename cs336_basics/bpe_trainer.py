@@ -7,7 +7,9 @@ import time
 import psutil
 import os
 from typing import BinaryIO
+from queue import Empty
 
+mp.set_start_method('spawn', force=True)
 def find_chunk_boundaries(
     file: BinaryIO,
     desired_num_chunks: int,
@@ -55,21 +57,19 @@ def find_chunk_boundaries(
     return sorted(set(chunk_boundaries))
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-def pre_tokenize_chunk(filename, start, end):
-    with open(filename, "rb") as f:
-        f.seek(start)
-        chunk = f.read(end - start).decode("utf-8", errors="ignore")
-        texts = re.split("<|endoftext|>", chunk)
-        word_counts = Counter()
-        for text in texts:
-            word_iter = re.finditer(PAT, text)
-            for word in word_iter:
-                word_bytes = bytes(word.group().encode('utf-8'))
-                word_counts[word_bytes] = word_counts.get(word_bytes, 0) + 1
-        return word_counts
+def pre_tokenize_chunk(chunk):
+    # print(len(chunk))
+    texts = re.split("<|endoftext|>", chunk.decode("utf-8", errors="ignore"))
+    word_counts = Counter()
+    for text in texts:
+        word_iter = re.finditer(PAT, text)
+        for word in word_iter:
+            word_bytes = bytes(word.group().encode('utf-8'))
+            word_counts[word_bytes] = word_counts.get(word_bytes, 0) + 1
+    return word_counts
 
-def get_new_word(word_to_tuple, pair, word):
-    word_tuple = word_to_tuple[word]
+def get_new_word(input_tuple):
+    word_tuple, pair, word = input_tuple
     new_word = []
     new_pairs = []
     old_pairs = []
@@ -99,20 +99,47 @@ def get_new_word(word_to_tuple, pair, word):
     # print(word, word_tuple, left_new_pairs, right_new_pairs)
     return word, new_word, new_pairs, old_pairs
 
-def train_bpe(input_path, vocab_size, special_tokens, num_processes=8):    
+def read_chunk(input_path):
     with open(input_path, "rb") as f:
-        boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
-    worker_pool = mp.Pool(num_processes)
-    pre_tokenize_chunk_partial = partial(pre_tokenize_chunk, input_path)
-    word_counters = worker_pool.starmap(pre_tokenize_chunk_partial, zip(boundaries[:-1], boundaries[1:]))
-    word_counters = reduce(lambda x, y: x + y, word_counters)
-    # print(merged)
+        boundaries = find_chunk_boundaries(f, 16, b"<|endoftext|>")
+        for start, end in zip(boundaries[:-1], boundaries[1:]):
+            f.seek(start)
+            chunk = f.read(end - start)
+            yield chunk
+
+def pre_tokenize_chunk_with_boundaries(input_tuple):
+    input_path, start, end = input_tuple
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start)
+    return pre_tokenize_chunk(chunk)
+
+K = 16
+def pre_tokenize(input_path, num_processes):
+    with open(input_path, "rb") as f:
+        boundaries = find_chunk_boundaries(f, num_processes*K, b"<|endoftext|>")
+    pool = mp.Pool(num_processes)
+    input_tuples = [(input_path, start, end) for start, end in zip(boundaries[:-1], boundaries[1:])]
+    bar = tqdm(total=len(input_tuples))
+    word_counters = Counter()
+    
+    # 使用imap逐个处理结果
+    for result in pool.imap(pre_tokenize_chunk_with_boundaries, input_tuples):
+        word_counters += result
+        bar.update(1)
+    
+    bar.close()
+    return word_counters
+
+def train_bpe(input_path, vocab_size, special_tokens, num_processes=8):    
+    word_counters = pre_tokenize(input_path, num_processes)
 
     vocab = dict()
     merges = []
     pair_counter = OrderedDict()
-    pair_to_word = dict()
-    word_to_tuple = dict()  
+    pair_to_idx = dict()
+    word_to_tuple = dict()
+    idx = 0
     for i in range(256):
         vocab[len(vocab)] = bytes([i])
         pair_counter[chr(i)] = 0
@@ -124,17 +151,25 @@ def train_bpe(input_path, vocab_size, special_tokens, num_processes=8):
         for i in range(len(word)-1):
             pair = word_tuple[i:i+2]
             pair_counter[pair] = pair_counter.get(pair, 0) + count
-            if pair not in pair_to_word:
-                pair_to_word[pair] = set()
-            pair_to_word[pair].add(word)
-    sorted_pair = sorted(pair_counter.items(), key=lambda x: x[1], reverse=True)
+            if pair not in pair_to_idx:
+                pair_to_idx[pair] = set()
+            pair_to_idx[pair].add(idx)
+        idx += 1
+    idx_to_word = list(word_counters.keys())
+    
+    # sorted_pair = sorted(pair_counter.items(), key=lambda x: x[1], reverse=True)
+    # print(len(sorted_pair))
     # print(sorted_pair[:10])
     # pair_counter = OrderedDict(sorted_pair)
+    pool = mp.Pool(num_processes)
     for _ in trange(vocab_size - len(vocab)):
         # get most frequent pair
         # max_pair = max(pair_counter.items(), key=lambda x: x[1])
         # merged_pair = max_pair[0]
         sorted_pair = sorted(pair_counter.items(), key=lambda x: x[1], reverse=True)
+        # print(len(sorted_pair))
+        if len(sorted_pair) > vocab_size:
+            pair_counter = dict(sorted_pair[:vocab_size])
         # print(sorted_pair[:3])
         max_freq = sorted_pair[0][1]
         candidate_pairs = [sorted_pair[0][0]]
@@ -145,26 +180,38 @@ def train_bpe(input_path, vocab_size, special_tokens, num_processes=8):
         merge_pair = max(candidate_pairs)
         # print(candidate_pairs, repr(merge_pair))
         merges.append(merge_pair)
-        words_need_update = pair_to_word[merge_pair]
-        assert len(words_need_update) == len(set(words_need_update))
-        for word in words_need_update:
-            word, new_word, new_pairs, old_pairs = get_new_word(word_to_tuple, merge_pair, word)
+        word_idxs_need_update = pair_to_idx[merge_pair]
+        # print(word_idxs_need_update)
+        assert len(word_idxs_need_update) == len(set(word_idxs_need_update))
+        input_tuples = []
+        for word_idx in list(word_idxs_need_update):
+            word = idx_to_word[word_idx]
+            word_tuple = word_to_tuple[word]
+        #     input_tuples.append((word_tuple, merge_pair, word))
+        # output_tuples = pool.map(get_new_word, input_tuples)
+        # for word, new_word, new_pairs, old_pairs in output_tuples:
+            word, new_word, new_pairs, old_pairs = get_new_word((word_tuple, merge_pair, word))
             word_count = word_counters[word]
             # print(new_pairs)
             for pair in new_pairs:
                 pair_counter[pair] = pair_counter.get(pair, 0) + word_count
-                if pair not in pair_to_word:
-                    pair_to_word[pair] = set()
-                pair_to_word[pair].add(word)
+                if pair not in pair_to_idx:
+                    pair_to_idx[pair] = set()
+                pair_to_idx[pair].add(word_idx)
             for pair in old_pairs:
                 if pair in pair_counter:
                     pair_counter[pair] -= word_count
-                if pair not in pair_to_word:
-                    pair_to_word[pair] = set()
-                pair_to_word[pair].add(word)
+            for i in range(len(new_word)-1):
+                if new_word[i:i+2] in old_pairs:
+                    old_pairs.remove(new_word[i:i+2])
+            for pair in old_pairs:
+                if pair in pair_to_idx:
+                    pair_to_idx[pair].discard(word_idx)
             word_to_tuple[word] = new_word
+
         vocab[len(vocab)] = merge_pair[0]+merge_pair[1]
         pair_counter.pop(merge_pair)
+        pair_to_idx.pop(merge_pair)
         # print(repr(merged_pair), len(word_counters), len(vocab), len(merges), merged_pair_bytes.decode('utf-8'))
         # break
     return vocab, merges
@@ -176,6 +223,7 @@ if __name__=='__main__':
     parser.add_argument("--input_path", type=str, default="data/TinyStoriesV2-GPT4-valid.txt")
     parser.add_argument("--vocab_size", type=int, default=500)
     parser.add_argument("--special_tokens", type=list, default=["<|endoftext|>"])
+    parser.add_argument("--save_path", type=str, default=None)
     args = parser.parse_args()
     # Track training start time and memory
     start_time = time.time()
@@ -184,6 +232,18 @@ if __name__=='__main__':
     print(f"Initial memory usage: {start_memory:.2f} MB")
     
     vocab, merges = train_bpe(args.input_path, args.vocab_size, args.special_tokens, args.num_processes)
+    if args.save_path is not None:
+        import json
+        # 确保保存目录存在
+        os.makedirs(args.save_path, exist_ok=True)
+        print(f"Created/ensured directory: {args.save_path}")
+        
+        # 保存vocab
+        import pickle
+        with open(os.path.join(args.save_path, "vocab.pkl"), "wb") as f:
+            pickle.dump(vocab, f)
+        with open(os.path.join(args.save_path, "merges.pkl"), "wb") as f:
+            pickle.dump(merges, f)
 
     # Calculate training statistics
     end_time = time.time()
