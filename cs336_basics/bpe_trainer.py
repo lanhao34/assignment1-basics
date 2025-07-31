@@ -6,7 +6,7 @@ from tqdm import tqdm, trange
 import time
 import psutil
 import os
-from typing import BinaryIO
+from typing import BinaryIO, Optional, Iterable
 from queue import Empty
 
 mp.set_start_method('spawn', force=True)
@@ -215,6 +215,117 @@ def train_bpe(input_path, vocab_size, special_tokens, num_processes=8):
         # print(repr(merged_pair), len(word_counters), len(vocab), len(merges), merged_pair_bytes.decode('utf-8'))
         # break
     return vocab, merges
+
+class Tokenizer:
+    def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: Optional[list[str]] = None):
+        self.vocab = vocab
+        self.merges = merges
+        self.lookup_vocab = {v: k for k, v in vocab.items()}
+        self.max_special_token_length = max(len(token) for token in special_tokens) if special_tokens is not None else 0
+        self.max_token_lenght = max(len(token) for token in vocab.values())
+        self.max_all_token_length = max(self.max_special_token_length, self.max_token_lenght)
+        self.vocab_size = len(vocab)
+        self.merges_size = len(merges)
+        self.special_tokens = sorted(special_tokens, key=len, reverse=True) if special_tokens is not None else []
+
+    def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: Optional[list[str]] = None) -> "Tokenizer":
+        with open(vocab_filepath, "rb") as f:
+            vocab = pickle.load(f)
+        with open(merges_filepath, "rb") as f:
+            merges = pickle.load(f)
+        return cls(vocab, merges, special_tokens)
+
+    def encode(self, text: str) -> list[int]:
+        return list(self.encode_iterable(iter(text)))
+    
+    def encode_bytes(self, bytes_buffer: bytes) -> tuple[int, bytes]:
+        assert len(bytes_buffer) > 0
+        if bytes_buffer in self.lookup_vocab:
+            return [self.lookup_vocab[bytes_buffer]]
+        bytes_buffer = [bytes([b]) for b in bytes_buffer]
+        while True:
+            flag = False
+            for merge in self.merges:
+                for i in range(len(bytes_buffer)-1):
+                    if (bytes_buffer[i], bytes_buffer[i+1]) == merge:
+                        bytes_buffer = bytes_buffer[:i] + [merge[0]+merge[1]] + bytes_buffer[i+2:]
+                        flag = True
+                        break
+                if flag:
+                    break
+            if not flag:
+                break
+        # print(bytes_buffer)
+        return [self.lookup_vocab[merged_bytes] for merged_bytes in bytes_buffer]
+        # raise ValueError(f"No token found for {bytes_buffer}")
+    
+    def encode_iterable(self, iterable: Iterable[str], text_buffer_length: int = 0) -> Iterable[int]:
+        text_buffer = ""
+        text_buffer_length = max(self.max_all_token_length, text_buffer_length)
+        while True:
+            try:
+                while len(text_buffer) < text_buffer_length:
+                    text = next(iterable)
+                    text_buffer += text
+                flag = False
+                for special_token in self.special_tokens:
+                    if special_token in text_buffer:
+                        flag = True
+                        idx = text_buffer.index(special_token)
+                        if idx == 0:
+                            yield self.lookup_vocab[special_token.encode('utf-8')]
+                            text_buffer = text_buffer[len(special_token):]
+                            break
+                        word_iter = re.finditer(PAT, text_buffer[:idx])
+                        text_buffer = text_buffer[idx:]
+                        for word in word_iter:
+                            word_bytes = bytes(word.group().encode('utf-8'))
+                            tokens = self.encode_bytes(word_bytes)
+                            for token in tokens:
+                                yield token
+                if flag:
+                    continue
+                word_iter = re.finditer(PAT, text_buffer)
+                word = next(word_iter).group()
+                text_buffer = text_buffer[len(word):]
+                word_bytes = bytes(word.encode('utf-8'))
+                tokens = self.encode_bytes(word_bytes)
+                for token in tokens:
+                    yield token
+            except StopIteration:
+                while len(text_buffer) > 0:
+                    flag = False
+                    for special_token in self.special_tokens:
+                        if special_token in text_buffer:
+                            flag = True
+                            idx = text_buffer.index(special_token)
+                            if idx == 0:
+                                yield self.lookup_vocab[special_token.encode('utf-8')]
+                                text_buffer = text_buffer[len(special_token):]
+                                break
+                            word_iter = re.finditer(PAT, text_buffer[:idx])
+                            text_buffer = text_buffer[idx:]
+                            for word in word_iter:
+                                word_bytes = bytes(word.group().encode('utf-8'))
+                                tokens = self.encode_bytes(word_bytes)
+                                for token in tokens:
+                                    yield token
+                            yield self.lookup_vocab[special_token.encode('utf-8')]
+                            text_buffer = text_buffer[len(special_token):]
+                            break
+                    if flag:
+                        continue
+                    word_iter = re.finditer(PAT, text_buffer)
+                    for word in word_iter:
+                        word_bytes = bytes(word.group().encode('utf-8'))
+                        tokens = self.encode_bytes(word_bytes)
+                        for token in tokens:
+                            yield token
+                    text_buffer = ""
+                break
+            
+    def decode(self, tokens: list[int]) -> str:
+        return b''.join([self.vocab[token] for token in tokens]).decode("utf-8", errors="replace")
 
 if __name__=='__main__':
     import argparse
