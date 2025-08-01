@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import einx
 
 class Linear(torch.nn.Module):
     def __init__(self, in_features: int, out_features: int, device=None, dtype=None, bias = True):
@@ -87,3 +88,28 @@ class RMSNorm(nn.Module):
         output = x / rms
         output = output * self.scale
         return output.to(in_dtype)
+
+
+class RotaryPositionalEmbedding(nn.Module):
+    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=None):
+        super().__init__()
+        self.theta = theta
+        self.d_k = d_k
+        self.max_seq_len = max_seq_len
+        self.device = device
+        inv_freqs = 1 / (theta **(torch.arange(0, d_k, 2, device=device) / d_k))
+        freqs = torch.einsum("i,j->ij", torch.arange(max_seq_len, device=device), inv_freqs)
+        sin = torch.sin(freqs)
+        cos = torch.cos(freqs)
+        self.register_buffer("sin", sin, persistent=False)
+        self.register_buffer("cos", cos, persistent=False)
+
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
+        sin = self.sin[token_positions]
+        cos = self.cos[token_positions]
+        x_even, x_odd = einx.rearrange("... (d p) -> ... p d", x, p=2).unbind(dim=-2) 
+        rot_even = einx.subtract("..., ... -> ...", x_even * cos, x_odd * sin)
+        rot_odd = einx.add("..., ... -> ...", x_even * sin, x_odd * cos)
+        x_rot = torch.stack((rot_even, rot_odd), dim=-1)
+        x_rot = einx.rearrange("... d p -> ... (d p)", x_rot, p=2)
+        return x_rot
