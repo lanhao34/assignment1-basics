@@ -32,6 +32,9 @@ class Embedding(torch.nn.Module):
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.weight[token_ids]
 
+def SiLU(x):
+    return torch.sigmoid(x) * x
+
 class SwiGLU(nn.Module):
     def __init__(self, input_dim, hidden_dim):
         super().__init__()
@@ -45,7 +48,7 @@ class SwiGLU(nn.Module):
         # a, b = x.chunk(2, dim=-1)
         
         # Swish门控计算
-        gate = F.silu(self.w1(x))  # F.silu等价于Swish(β=1)
+        gate = SiLU(self.w1(x))  # F.silu等价于Swish(β=1)
         filtered = gate * self.w3(x)
         return self.w2(filtered)
 
