@@ -4,13 +4,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class Linear(torch.nn.Module):
-    def __init__(self, in_features: int, out_features: int, bias = True):
+    def __init__(self, in_features: int, out_features: int, device=None, dtype=None, bias = True):
         super().__init__()
-        self.weight = torch.nn.Parameter(torch.randn(out_features, in_features))
+        self.weight = torch.nn.Parameter(torch.empty(out_features, in_features, device=device, dtype=dtype))
         if bias:
-            self.bias = torch.nn.Parameter(torch.randn(out_features))
+            self.bias = torch.nn.Parameter(torch.zeros(out_features, device=device, dtype=dtype))
         else:
             self.bias = None
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.trunc_normal_(self.weight, std=0.02)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x @ self.weight.T
@@ -19,12 +25,12 @@ class Linear(torch.nn.Module):
         return x
 
 class Embedding(torch.nn.Module):
-    def __init__(self, vocab_size: int, d_model: int):
+    def __init__(self, num_embeddings: int, embedding_dim: int, device=None, dtype=None):
         super().__init__()
-        self.weight = torch.nn.Parameter(torch.randn(vocab_size, d_model))
+        self.weight = torch.nn.Parameter(torch.randn(num_embeddings, embedding_dim, device=device, dtype=dtype))
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.weight[x]
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        return self.weight[token_ids]
 
 class SwiGLU(nn.Module):
     def __init__(self, input_dim, hidden_dim):
@@ -63,3 +69,18 @@ class MultiHeadAttention(nn.Module):
         self.v_proj = Linear(d_in, d_model, bias=False)
         self.o_proj = Linear(d_model, d_in, bias=False)
 
+
+class RMSNorm(nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-5, device=None, dtype=None):
+        super().__init__()
+        self.d_model = d_model
+        self.eps = eps
+        self.scale = nn.Parameter(torch.ones(d_model, device=device, dtype=dtype))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        in_dtype = x.dtype
+        x = x.to(torch.float32)
+        rms = torch.sqrt(torch.pow(x, 2).mean(dim=-1, keepdim=True) + self.eps)
+        output = x / rms
+        output = output * self.scale
+        return output.to(in_dtype)
