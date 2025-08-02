@@ -54,24 +54,49 @@ class SwiGLU(nn.Module):
         return self.w2(filtered)
 
 def scaled_dot_product_attention(Q, K, V, mask = None):
-    attn_score = Q @ K.transpose(-2, -1)
+    seq_len = Q.shape[-2]
+    attn_score = torch.zeros(Q.shape[0], Q.shape[1], seq_len, seq_len, device=Q.device)
+    for i in range(seq_len):
+        for j in range(seq_len):
+            if mask is not None and mask[i, j] == 0:
+                attn_score[:, :, i, j] = torch.tensor(float("-inf"), device=Q.device)
+            else:
+                temp = einx.dot("... h s d, ... h s d -> ... h s", Q[:, :, i, :], K[:, :, j, :])
+                attn_score[:, :, i, j] = temp
     attn_score = attn_score / math.sqrt(K.shape[-1])
-    if mask is not None:
-        attn_score = attn_score.masked_fill(mask == 0, float("-inf"))
     attn_score = F.softmax(attn_score, dim=-1)
     return attn_score @ V
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model, d_in, d_k, num_heads):
+    def __init__(self, d_model, d_in, num_heads, rope=None):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
-        self.d_v = d_model // num_heads
         self.q_proj = Linear(d_in, d_model, bias=False)
         self.k_proj = Linear(d_in, d_model, bias=False)
         self.v_proj = Linear(d_in, d_model, bias=False)
         self.o_proj = Linear(d_model, d_in, bias=False)
+        self.rope = rope
+    
+    def forward(self, x, token_positions=None):
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        q = einx.rearrange("... s (h d) -> ... h s d", q, h=self.num_heads)
+        k = einx.rearrange("... s (h d) -> ... h s d", k, h=self.num_heads)
+        v = einx.rearrange("... s (h d) -> ... h s d", v, h=self.num_heads)
+        if self.rope is not None:
+            if token_positions is None:
+                token_positions = torch.arange(x.shape[-2], device=x.device)
+            q = self.rope(q, token_positions)
+            k = self.rope(k, token_positions)
+        causal_mask = torch.triu(torch.ones(x.shape[-2], x.shape[-2], device=x.device), diagonal=1)
+        causal_mask = torch.ones_like(causal_mask) - causal_mask
+        causal_mask = causal_mask.bool()
+        attn_score = scaled_dot_product_attention(q, k, v, causal_mask)
+        attn_score = einx.rearrange("... h s d -> ... s (h d)", attn_score, h=self.num_heads)
+        return self.o_proj(attn_score)
 
 
 class RMSNorm(nn.Module):
@@ -119,3 +144,47 @@ def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
     e = torch.exp(x)
     s = e.sum(dim=dim, keepdim=True)
     return e / s
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model, num_heads, d_ff, max_seq_len, rope=None):
+        super().__init__()
+        self.rope = rope
+        self.mha = MultiHeadAttention(d_model, d_model, num_heads, rope=rope)
+        self.ffn = SwiGLU(d_model, d_ff)
+        self.norm1 = RMSNorm(d_model)
+        self.norm2 = RMSNorm(d_model)
+
+    def forward(self, x, token_positions=None):
+        residual = x
+        x = self.norm1(x)
+        x = self.mha(x, token_positions=token_positions)
+        x = x + residual
+        residual = x
+        x = self.norm2(x)
+        x = self.ffn(x)
+        x = x + residual
+        return x
+
+
+class TransformerLM(nn.Module):
+    def __init__(self, vocab_size, context_length, d_model, num_layers, num_heads, d_ff, rope_theta):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.embedding = Embedding(vocab_size, d_model)
+        self.rope = RotaryPositionalEmbedding(rope_theta, d_model // num_heads, context_length)
+        self.layers = nn.ModuleList([TransformerBlock(d_model, num_heads, d_ff, context_length, self.rope) for _ in range(num_layers)])
+        self.norm = RMSNorm(d_model)
+        self.lm_head = Linear(d_model, vocab_size, bias=False)
+
+    def forward(self, token_ids, token_positions=None):
+        x = self.embedding(token_ids)
+        for layer in self.layers:
+            x = layer(x, token_positions)
+        x = self.norm(x)
+        return self.lm_head(x)
