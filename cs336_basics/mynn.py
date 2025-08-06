@@ -188,3 +188,110 @@ class TransformerLM(nn.Module):
             x = layer(x, token_positions)
         x = self.norm(x)
         return self.lm_head(x)
+    
+
+class CrossEntropyLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, logits, targets):
+        log_probs = F.log_softmax(logits, dim=-1)
+        loss = -log_probs.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+        return loss.mean()
+
+
+class SGD(torch.optim.Optimizer):
+    def __init__(self, params, lr, momentum=0, weight_decay=0):
+        if lr < 0:
+            raise ValueError("Invalid learning rate: {}".format(lr))
+        defaults = {"lr": lr}
+        super().__init__(params, defaults)
+
+    def step(self, closure=None):
+        loss = None if closure is None else closure()
+        for group in self.param_groups:
+            lr = group["lr"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                    
+                state = self.state[p]
+                t = state.get("step", 0)
+                p.data -= lr/math.sqrt(t+1) * p.grad
+                state["step"] = t + 1
+        return loss
+
+
+class AdamW(torch.optim.Optimizer):
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0):
+        if not 0.0 <= lr:
+            raise ValueError("Invalid learning rate: {}".format(lr))
+        if not 0.0 <= eps:
+            raise ValueError("Invalid epsilon: {}".format(eps))
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError("Invalid beta1 parameter at index 0: {}".format(betas[0]))
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError("Invalid beta2 parameter at index 1: {}".format(betas[1]))
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    def step(self, closure=None):
+        loss = None if closure is None else closure()
+        for group in self.param_groups:
+            lr = group["lr"]
+            betas = group["betas"]
+            eps = group["eps"]
+            weight_decay = group["weight_decay"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                m = state.get("m", torch.zeros_like(p))
+                v = state.get("v", torch.zeros_like(p))
+                t = state.get("step", 0) + 1
+                m = betas[0] * m + (1 - betas[0]) * p.grad
+                v = betas[1] * v + (1 - betas[1]) * p.grad ** 2
+                alpha = lr * math.sqrt(1 - betas[1] ** t) / (1 - betas[0] ** t)
+                p.data -= alpha * m / (torch.sqrt(v) + eps)
+                p.data = p.data - lr * p.data * weight_decay
+                state["step"] = t
+                state["m"] = m
+                state["v"] = v
+        return loss
+
+
+class LinearWarmupCosineAnnealingLR:
+    def __init__(self, warmup_steps, cosine_annealing_steps, max_lr, min_lr, last_epoch=-1):
+        self.warmup_steps = warmup_steps
+        self.cosine_annealing_steps = cosine_annealing_steps
+        self.max_lr = max_lr
+        self.min_lr = min_lr
+        self.last_epoch = last_epoch
+
+    def step(self, epoch=None):
+        if epoch is None:
+            epoch = self.last_epoch + 1
+        if epoch < self.warmup_steps:
+            lr = self.max_lr * epoch / self.warmup_steps
+        elif epoch < self.cosine_annealing_steps:
+            lr = self.min_lr + (self.max_lr - self.min_lr) * (1 + math.cos(math.pi * (epoch - self.warmup_steps) / (self.cosine_annealing_steps - self.warmup_steps))) / 2
+        else:
+            lr = self.min_lr
+        self.last_epoch = epoch
+        return lr
+
+class GradientClipper:
+    def __init__(self, max_l2_norm):
+        self.max_l2_norm = max_l2_norm
+
+    def __call__(self, parameters):
+        total_norm = 0
+        for p in parameters:
+            if p.grad is not None:
+                total_norm += p.grad.norm(2) ** 2
+        total_norm = math.sqrt(total_norm)
+        if total_norm > self.max_l2_norm:
+            scale = self.max_l2_norm / (total_norm + 1e-6)
+            for p in parameters:
+                if p.grad is not None:
+                    p.grad = p.grad * scale
