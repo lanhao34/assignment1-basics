@@ -53,7 +53,7 @@ class SwiGLU(nn.Module):
         filtered = gate * self.w3(x)
         return self.w2(filtered)
 
-def scaled_dot_product_attention(Q, K, V, mask = None):
+def flash_attention(Q, K, V, mask = None):
     seq_len = Q.shape[-2]
     attn_score = torch.zeros(Q.shape[0], Q.shape[1], seq_len, seq_len, device=Q.device)
     for i in range(seq_len):
@@ -61,11 +61,20 @@ def scaled_dot_product_attention(Q, K, V, mask = None):
             if mask is not None and mask[i, j] == 0:
                 attn_score[:, :, i, j] = torch.tensor(float("-inf"), device=Q.device)
             else:
-                temp = einx.dot("... h s d, ... h s d -> ... h s", Q[:, :, i, :], K[:, :, j, :])
+                temp = torch.matmul(Q[:, :, i, :], K[:, :, j, :].transpose(-2, -1))
                 attn_score[:, :, i, j] = temp
     attn_score = attn_score / math.sqrt(K.shape[-1])
     attn_score = F.softmax(attn_score, dim=-1)
     return attn_score @ V
+
+# masked scaled dot product attention
+def scaled_dot_product_attention(Q, K, V, mask = None):
+    attn_scores = torch.matmul(Q, K.transpose(-2, -1))
+    attn_scores = attn_scores / math.sqrt(K.shape[-1])
+    if mask is not None:
+        attn_scores = attn_scores.masked_fill(~mask, float("-inf"))
+    attn_scores = F.softmax(attn_scores, dim=-1)
+    return attn_scores @ V
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, d_model, d_in, num_heads, rope=None):
